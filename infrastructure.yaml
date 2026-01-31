@@ -1,0 +1,297 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'OpenSearch and MySQL on EC2 Spot Instance with SSM Access'
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.large
+    Description: EC2 instance type for OpenSearch and MySQL
+    AllowedValues:
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+      - m5.large
+      - m5.xlarge
+      - r5.large
+  
+  OpenSearchVersion:
+    Type: String
+    Default: '2.11.1'
+    Description: OpenSearch version to install
+  
+  MySQLRootPassword:
+    Type: String
+    NoEcho: true
+    Description: Root password for MySQL (must meet complexity requirements)
+    MinLength: 8
+    Default: 'MySecurePass123!'
+  
+  MySQLBenchPassword:
+    Type: String
+    NoEcho: true
+    Description: Password for benchmark user (must meet complexity requirements)
+    MinLength: 8
+    Default: 'BenchPass123!'
+  
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where the instance will be launched
+  
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet ID where the instance will be launched
+  
+  SpotPrice:
+    Type: String
+    Default: '0.05'
+    Description: Maximum spot price per hour (leave default for on-demand price)
+
+Resources:
+  OpenSearchSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for OpenSearch and MySQL EC2 instance
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 9200
+          ToPort: 9200
+          CidrIp: 10.0.0.0/8
+          Description: OpenSearch REST API
+        - IpProtocol: tcp
+          FromPort: 5601
+          ToPort: 5601
+          CidrIp: 10.0.0.0/8
+          Description: OpenSearch Dashboards
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 10.0.0.0/8
+          Description: MySQL Database
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: OpenSearch-MySQL-SecurityGroup
+
+  OpenSearchInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: OpenSearch-MySQL-Instance-Role
+
+  OpenSearchInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref OpenSearchInstanceRole
+
+  OpenSearchLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: OpenSearchMySQLSpotTemplate
+      LaunchTemplateData:
+        ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt OpenSearchInstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref OpenSearchSecurityGroup
+        InstanceMarketOptions:
+          MarketType: spot
+          SpotOptions:
+            MaxPrice: !Ref SpotPrice
+            SpotInstanceType: one-time
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 50
+              VolumeType: gp3
+              DeleteOnTermination: true
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -e
+            
+            # Update system
+            dnf update -y
+            
+            # Install required packages
+            dnf install -y java-17-amazon-corretto-headless wget python3 python3-pip
+            
+            # Set Java environment
+            echo "export JAVA_HOME=/usr/lib/jvm/java-17-amazon-corretto" >> /etc/profile.d/java.sh
+            echo "export PATH=\$JAVA_HOME/bin:\$PATH" >> /etc/profile.d/java.sh
+            source /etc/profile.d/java.sh
+            
+            # ===============================
+            # Install OpenSearch
+            # ===============================
+            
+            # Create opensearch user
+            useradd -m -s /bin/bash opensearch
+            
+            # Download and install OpenSearch
+            cd /opt
+            wget https://artifacts.opensearch.org/releases/bundle/opensearch/${OpenSearchVersion}/opensearch-${OpenSearchVersion}-linux-x64.tar.gz
+            tar -xzf opensearch-${OpenSearchVersion}-linux-x64.tar.gz
+            mv opensearch-${OpenSearchVersion} opensearch
+            rm opensearch-${OpenSearchVersion}-linux-x64.tar.gz
+            
+            # Configure OpenSearch for single node
+            cat > /opt/opensearch/config/opensearch.yml <<EOF
+            cluster.name: opensearch-test-cluster
+            node.name: opensearch-node1
+            path.data: /var/lib/opensearch
+            path.logs: /var/log/opensearch
+            network.host: 0.0.0.0
+            http.port: 9200
+            discovery.type: single-node
+            plugins.security.disabled: true
+            bootstrap.memory_lock: false
+            EOF
+            
+            # Create data and log directories
+            mkdir -p /var/lib/opensearch
+            mkdir -p /var/log/opensearch
+            chown -R opensearch:opensearch /opt/opensearch
+            chown -R opensearch:opensearch /var/lib/opensearch
+            chown -R opensearch:opensearch /var/log/opensearch
+            
+            # Set system limits
+            cat >> /etc/security/limits.conf <<EOF
+            opensearch soft nofile 65536
+            opensearch hard nofile 65536
+            opensearch soft memlock unlimited
+            opensearch hard memlock unlimited
+            EOF
+            
+            # Configure vm.max_map_count
+            echo "vm.max_map_count=262144" >> /etc/sysctl.conf
+            sysctl -p
+            
+            # Create systemd service for OpenSearch
+            cat > /etc/systemd/system/opensearch.service <<EOF
+            [Unit]
+            Description=OpenSearch
+            After=network.target
+            
+            [Service]
+            Type=simple
+            User=opensearch
+            Group=opensearch
+            ExecStart=/opt/opensearch/bin/opensearch
+            Restart=on-failure
+            RestartSec=10
+            StandardOutput=journal
+            StandardError=journal
+            LimitNOFILE=65536
+            LimitMEMLOCK=infinity
+            
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            
+            # Start OpenSearch
+            systemctl daemon-reload
+            systemctl enable opensearch
+            systemctl start opensearch
+            
+            # ===============================
+            # Install MySQL
+            # ===============================
+            
+            # Download and install MySQL repository
+            cd /tmp
+            wget https://dev.mysql.com/get/mysql80-community-release-el9-1.noarch.rpm
+            dnf install -y mysql80-community-release-el9-1.noarch.rpm
+            rpm --import https://repo.mysql.com/RPM-GPG-KEY-mysql-2023
+            
+            # Install MySQL server
+            dnf install -y mysql-community-server
+            
+            # Configure MySQL
+            cat >> /etc/my.cnf <<EOF
+            
+            # InnoDB settings for better performance
+            innodb_buffer_pool_size = 512M
+            innodb_log_file_size = 128M
+            
+            # Full-text search settings
+            innodb_ft_min_token_size = 2
+            ft_min_word_len = 2
+            EOF
+            
+            # Start MySQL
+            systemctl start mysqld
+            systemctl enable mysqld
+            
+            # Get temporary password
+            TEMP_PASS=$(grep 'temporary password' /var/log/mysqld.log | awk '{print $NF}')
+            
+            # Change root password and create benchmark user
+            mysql --connect-expired-password -u root -p"$TEMP_PASS" <<MYSQL_SCRIPT
+            ALTER USER 'root'@'localhost' IDENTIFIED BY '${MySQLRootPassword}';
+            CREATE DATABASE IF NOT EXISTS testdb;
+            CREATE USER IF NOT EXISTS 'benchuser'@'localhost' IDENTIFIED BY '${MySQLBenchPassword}';
+            GRANT ALL PRIVILEGES ON testdb.* TO 'benchuser'@'localhost';
+            FLUSH PRIVILEGES;
+            MYSQL_SCRIPT
+            
+            # ===============================
+            # Install Python packages
+            # ===============================
+            
+            pip3 install opensearch-py pymysql faker boto3
+            
+  OpenSearchInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref OpenSearchLaunchTemplate
+        Version: !GetAtt OpenSearchLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref SubnetId
+      Tags:
+        - Key: Name
+          Value: OpenSearch-MySQL-Spot-Instance
+
+Outputs:
+  InstanceId:
+    Description: Instance ID of OpenSearch and MySQL EC2
+    Value: !Ref OpenSearchInstance
+  
+  OpenSearchEndpoint:
+    Description: OpenSearch REST API Endpoint
+    Value: !Sub 'http://${OpenSearchInstance.PrivateIp}:9200'
+  
+  MySQLEndpoint:
+    Description: MySQL Database Endpoint
+    Value: !Sub '${OpenSearchInstance.PrivateIp}:3306'
+  
+  PrivateIP:
+    Description: Private IP of the instance
+    Value: !GetAtt OpenSearchInstance.PrivateIp
+  
+  SSMConnectCommand:
+    Description: Command to connect via SSM
+    Value: !Sub 'aws ssm start-session --target ${OpenSearchInstance}'
+  
+  ProjectDirectory:
+    Description: Benchmark project directory
+    Value: '/home/ec2-user/opensearch-benchmark'
+  
+  MySQLBenchUserPassword:
+    Description: MySQL benchmark user password
+    Value: !Ref MySQLBenchPassword

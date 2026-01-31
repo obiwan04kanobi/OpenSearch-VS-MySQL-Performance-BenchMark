@@ -10,12 +10,12 @@
 ## 📊 Benchmark Results
 
 ### 10,000 Records
-![](/images/1.png)
+![](/images/3.png)
 ----------------------
 ![](/images/2.png)
 
 ### 100,000 Records
-![](/images/3.png)
+![](/images/1.png)
 
 **Key Insight**: OpenSearch maintains consistent sub-10ms performance while MySQL degrades 10x as dataset grows from 10K → 100K records.
 

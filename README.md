@@ -123,6 +123,12 @@ python3 load_opensearch.py -f products.json -i products
 # Load into MySQL
 python3 load_mysql.py -f products.json -t products
 
+# Run benchmark
+python3 benchmark.py \
+  --os-index products \
+  --mysql-table products \
+  --label "10K records"
+
 ```
 
 
@@ -138,6 +144,13 @@ python3 load_opensearch.py -f products_large.json -i products_large
 # Load into MySQL
 python3 load_mysql.py -f products_large.json -t products_large
 
+# Run benchmark
+python3 benchmark.py \
+  --os-index products_large \
+  --mysql-table products_large \
+  --label "100K records"
+
+
 ```
 
 ## 📁 Project Files
@@ -147,6 +160,7 @@ python3 load_mysql.py -f products_large.json -t products_large
 | `generate_data.py` | Generate products with configurable size (CLI arg: -n) |
 | `load_opensearch.py` | Bulk load products into OpenSearch (CLI args: -f, -i) |
 | `load_mysql.py` | Batch insert products into MySQL (CLI args: -f, -t) |
+| `benchmark.py` | Run OpenSearch vs MySQL performance benchmarks for any dataset size (CLI args: --os-index, --mysql-table, --label) |
 
 ## 🔍 Benchmark Queries
 
@@ -236,6 +250,13 @@ Edit the generation scripts:
 ```python
 # Generate any dataset size
 python3 generate_data.py -n 50000
+
+# Benchmark that dataset (example: 50K records stored in products_50k)
+python3 benchmark.py \
+  --os-index products_50k \
+  --mysql-table products_50k \
+  --label "50K records"
+
 ```
 
 ### Add Custom Queries
